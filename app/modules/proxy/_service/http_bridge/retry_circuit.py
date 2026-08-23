@@ -8,6 +8,10 @@ from typing import Any
 import anyio
 
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, http_bridge_retry_circuit_total
+from app.modules.proxy._service.http_bridge.quarantine import (
+    _HTTP_BRIDGE_QUARANTINE_POISONED_ANCHOR_REASON,
+    _quarantine_http_bridge_session,
+)
 from app.modules.proxy._service.observability import _hash_identifier
 from app.modules.proxy._service.support import (
     _HTTPBridgeResponseCreateAttempt,
@@ -447,6 +451,37 @@ class _HTTPBridgeRetryCircuitMixin:
             )
             return False
 
+    async def _http_bridge_precreated_retry_block(
+        self: Any,
+        session: _HTTPBridgeSession,
+    ) -> tuple[float, str]:
+        """Return ``(seconds_blocked, reason)`` for a suppressed submission.
+
+        The cooldown is not always what is refusing the request: once it has
+        expired, the half-open lease keeps refusing everything except the one
+        admitted probe. Reporting the cooldown in that window advertises a
+        retry-after of ~1s while the caller is barred for the rest of the
+        lease, which turns a wedged key into a client retry storm.
+        """
+        if session.key.strength != "hard":
+            return 0.0, "none"
+
+        await self._load_http_bridge_retry_circuit(session)
+        now = time.monotonic()
+        async with self._http_bridge_retry_circuit_lock:
+            state = self._http_bridge_retry_circuits.get(session.key)
+            if state is None:
+                return 0.0, "none"
+            cooldown_remaining = max(0.0, state.cooldown_until - now)
+            half_open_remaining = (
+                max(0.0, state.half_open_until - now)
+                if state.consecutive_failures >= _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD
+                else 0.0
+            )
+        if half_open_remaining > cooldown_remaining:
+            return half_open_remaining, "hard_key_half_open"
+        return cooldown_remaining, "hard_key_cooldown"
+
     async def _http_bridge_precreated_retry_cooldown_seconds(self: Any, session: _HTTPBridgeSession) -> float:
         if session.key.strength != "hard":
             return 0.0
@@ -489,6 +524,7 @@ class _HTTPBridgeRetryCircuitMixin:
         now = time.monotonic()
         duplicate_attempt: _HTTPBridgeResponseCreateAttempt | None = None
         state: _HTTPBridgeRetryCircuitState | None = None
+        quarantine_poisoned_anchor = False
         async with self._http_bridge_retry_circuit_lock:
             if scoped_attempt is not None and scoped_attempt.retry_circuit_failure_recorded:
                 duplicate_attempt = scoped_attempt
@@ -515,6 +551,13 @@ class _HTTPBridgeRetryCircuitMixin:
                     if detail == "clean_close":
                         backoff = min(backoff, clean_close_max_backoff)
                     state.cooldown_until = max(state.cooldown_until, now + backoff)
+                    # The probe admitted after this cooldown is planned before
+                    # it reaches the gate, so an anchor the circuit opened on
+                    # has to be suppressed at planning time. Quarantining the
+                    # key routes a full-resend probe through the existing
+                    # unanchored fresh path; delta-only payloads keep their
+                    # anchor there, because it is their only context.
+                    quarantine_poisoned_anchor = _http_bridge_anchor_poison_detail(detail) is not None
                     if PROMETHEUS_AVAILABLE and http_bridge_retry_circuit_total is not None:
                         http_bridge_retry_circuit_total.labels(outcome="opened").inc()
                     logger.warning(
@@ -533,6 +576,12 @@ class _HTTPBridgeRetryCircuitMixin:
                 detail=detail,
             )
         assert state is not None
+        if quarantine_poisoned_anchor:
+            _quarantine_http_bridge_session(
+                self,
+                session,
+                reason=_HTTP_BRIDGE_QUARANTINE_POISONED_ANCHOR_REASON,
+            )
         try:
             await self._persist_http_bridge_retry_circuit(session, state)
             async with self._http_bridge_retry_circuit_lock:
