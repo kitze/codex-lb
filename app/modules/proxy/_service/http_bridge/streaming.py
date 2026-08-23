@@ -173,6 +173,7 @@ from app.modules.proxy._service.support import (
     _signal_propagated_responses_service_cleanup_ready,
     _ttft_event_visible_at,
     _WebSocketRequestState,
+    upstream_websocket_transport_recently_failed,
 )
 from app.modules.proxy._service.support import (
     _websocket_route_log_kwargs as _websocket_route_log_kwargs,
@@ -241,6 +242,10 @@ logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
 _REQUEST_TRANSPORT_HTTP = "http"
 _RESPONSE_CREATE_GATE_RETRY_SLEEP_SECONDS = 10.0
+# Provenance marker for bridge session-creation failures. Creation happens
+# strictly before the turn is submitted upstream, so only exceptions carrying
+# this attribute are safe for the wrapper's raw-HTTP replay.
+_HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR = "http_bridge_pre_submit_failure"
 
 
 def _http_bridge_continuity_bound_without_safe_replay(request_state: _WebSocketRequestState) -> bool:
@@ -962,6 +967,33 @@ class _HTTPBridgeStreamingMixin:
                 request_id,
             )
             runtime_config = dataclasses.replace(runtime_config, enabled=False)
+        # The bridge exists to hold upstream websocket sessions, so a pinned
+        # "http" upstream transport must bypass it; without this gate the
+        # dashboard pin is silently ignored for bridged follow-up turns.
+        configured_upstream_transport = getattr(dashboard_settings, "upstream_stream_transport", "default")
+        if configured_upstream_transport == "default":
+            configured_upstream_transport = getattr(_service_get_settings(), "upstream_stream_transport", "auto")
+        if runtime_config.enabled and configured_upstream_transport == "http":
+            logger.info(
+                "stream_responses bypassing http bridge for pinned http upstream transport request_id=%s",
+                request_id,
+            )
+            force_upstream_stream_transport = "http"
+            runtime_config = dataclasses.replace(runtime_config, enabled=False)
+        # While the websocket transport-failure marker is armed, every
+        # responses path must degrade to the HTTP upstream: the bridge would
+        # stall on its websocket session creation, and the raw path's "smart"
+        # policy can resolve a sticky follow-up straight back to the
+        # unavailable websocket upstream.
+        if force_upstream_stream_transport is None and upstream_websocket_transport_recently_failed():
+            if runtime_config.enabled:
+                logger.info(
+                    "stream_responses bypassing http bridge for recent upstream websocket transport failure "
+                    "request_id=%s",
+                    request_id,
+                )
+                runtime_config = dataclasses.replace(runtime_config, enabled=False)
+            force_upstream_stream_transport = "http"
         if not runtime_config.enabled:
             stream_with_retry = cast(Callable[..., AsyncIterator[str]], self._stream_with_retry)
             async for line in stream_with_retry(
@@ -985,36 +1017,62 @@ class _HTTPBridgeStreamingMixin:
 
         request_scope_id = ensure_request_scope_id()
         deferred_account_backoff_tracker = _DeferredAccountBackoffTracker()
+        bridge_yielded_any = False
+        bridge_transport_unavailable = False
         try:
-            async for line in self._stream_via_http_bridge(
-                payload,
-                headers,
-                codex_session_affinity=codex_session_affinity,
-                propagate_http_errors=propagate_http_errors,
-                openai_cache_affinity=openai_cache_affinity,
-                api_key=api_key,
-                api_key_reservation=api_key_reservation,
-                suppress_text_done_events=suppress_text_done_events,
-                idle_ttl_seconds=runtime_config.idle_ttl_seconds,
-                codex_idle_ttl_seconds=runtime_config.codex_idle_ttl_seconds,
-                max_sessions=runtime_config.max_sessions,
-                queue_limit=runtime_config.queue_limit,
-                prompt_cache_idle_ttl_seconds=runtime_config.prompt_cache_idle_ttl_seconds,
-                downstream_turn_state=downstream_turn_state,
-                forwarded_request=forwarded_request,
-                forwarded_original_request_unanchored=forwarded_original_request_unanchored,
-                forwarded_legacy_signature=forwarded_legacy_signature,
-                proxy_api_authorization=proxy_api_authorization,
-                forwarded_affinity_kind=forwarded_affinity_kind,
-                forwarded_affinity_key=forwarded_affinity_key,
-                rewritten_file_account_id=rewritten_file_account_id,
-                client_ip=client_ip,
-                enforce_openai_sdk_contract=enforce_openai_sdk_contract,
-                capacity_startup_wait_event=capacity_startup_wait_event,
-                capacity_startup_ready_event=capacity_startup_ready_event,
-                deferred_account_backoff_tracker=deferred_account_backoff_tracker,
-            ):
-                yield line
+            try:
+                async for line in self._stream_via_http_bridge(
+                    payload,
+                    headers,
+                    codex_session_affinity=codex_session_affinity,
+                    propagate_http_errors=propagate_http_errors,
+                    openai_cache_affinity=openai_cache_affinity,
+                    api_key=api_key,
+                    api_key_reservation=api_key_reservation,
+                    suppress_text_done_events=suppress_text_done_events,
+                    idle_ttl_seconds=runtime_config.idle_ttl_seconds,
+                    codex_idle_ttl_seconds=runtime_config.codex_idle_ttl_seconds,
+                    max_sessions=runtime_config.max_sessions,
+                    queue_limit=runtime_config.queue_limit,
+                    prompt_cache_idle_ttl_seconds=runtime_config.prompt_cache_idle_ttl_seconds,
+                    downstream_turn_state=downstream_turn_state,
+                    forwarded_request=forwarded_request,
+                    forwarded_original_request_unanchored=forwarded_original_request_unanchored,
+                    forwarded_legacy_signature=forwarded_legacy_signature,
+                    proxy_api_authorization=proxy_api_authorization,
+                    forwarded_affinity_kind=forwarded_affinity_kind,
+                    forwarded_affinity_key=forwarded_affinity_key,
+                    rewritten_file_account_id=rewritten_file_account_id,
+                    client_ip=client_ip,
+                    enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+                    capacity_startup_wait_event=capacity_startup_wait_event,
+                    capacity_startup_ready_event=capacity_startup_ready_event,
+                    deferred_account_backoff_tracker=deferred_account_backoff_tracker,
+                ):
+                    bridge_yielded_any = True
+                    yield line
+            except ProxyResponseError as exc:
+                # A transient failure to establish the bridge's upstream
+                # websocket session must not fail the turn while the plain
+                # HTTP upstream path is healthy. The replay is safe only for
+                # failures carrying pre-submit session-creation provenance —
+                # a post-dispatch ``upstream_unavailable`` (for example a
+                # submit whose request already holds upstream response
+                # events) must propagate, or the raw-HTTP retry dispatches
+                # the same turn twice. It is also confined to the
+                # subscription path: API-key reservations are settled by the
+                # finally block below, so re-entering streaming with the
+                # same reservation would double-settle it.
+                fallback_error_code, _fallback_error_message = _proxy_error_code_message(exc)
+                if (
+                    bridge_yielded_any
+                    or api_key_reservation is not None
+                    or not getattr(exc, _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR, False)
+                    or fallback_error_code != "upstream_unavailable"
+                    or (exc.status_code is not None and exc.status_code < 500)
+                ):
+                    raise
+                bridge_transport_unavailable = True
         finally:
             with anyio.CancelScope(shield=True):
                 try:
@@ -1046,6 +1104,30 @@ class _HTTPBridgeStreamingMixin:
                         self,
                         request_scope_id=request_scope_id,
                     )
+        if not bridge_transport_unavailable:
+            return
+        logger.warning(
+            "stream_responses http bridge upstream unavailable; retrying over http upstream transport request_id=%s",
+            request_id,
+        )
+        stream_with_retry = cast(Callable[..., AsyncIterator[str]], self._stream_with_retry)
+        async for line in stream_with_retry(
+            payload,
+            headers,
+            codex_session_affinity=codex_session_affinity,
+            propagate_http_errors=propagate_http_errors,
+            openai_cache_affinity=openai_cache_affinity,
+            api_key=api_key,
+            api_key_reservation=api_key_reservation,
+            suppress_text_done_events=suppress_text_done_events,
+            request_transport=_REQUEST_TRANSPORT_HTTP,
+            rewritten_file_account_id=rewritten_file_account_id,
+            file_account_resolution_complete=True,
+            upstream_stream_transport_override="http",
+            client_ip=client_ip,
+            enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        ):
+            yield line
 
     async def _stream_via_http_bridge(
         self: Any,
@@ -2099,6 +2181,10 @@ class _HTTPBridgeStreamingMixin:
                     defer_account_health_writes=request_state.api_key_reservation is not None,
                 )
             except ProxyResponseError as exc:
+                # Session creation failed before the turn was submitted
+                # upstream; record that provenance so the outer wrapper knows
+                # a raw-HTTP replay cannot dispatch the turn twice.
+                setattr(exc, _HTTP_BRIDGE_PRE_SUBMIT_FAILURE_ATTR, True)
                 if not owner_unavailable_allows_account_neutral_replay(exc):
                     exc_code, _exc_message = _proxy_error_code_message(exc)
                     if not unanchored_fork_spill_attempted and _http_bridge_unanchored_fork_can_spill_on_cap(
